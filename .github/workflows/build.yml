@@ -48,6 +48,7 @@ jobs:
           cat > launcher/app/src/main/AndroidManifest.xml <<'EOF_FILE'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
               <application
@@ -77,11 +78,13 @@ jobs:
           package com.fast.launcher;
 
           import android.app.Activity;
+          import android.app.AlertDialog;
           import android.content.BroadcastReceiver;
           import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
           import android.content.IntentFilter;
+          import android.content.SharedPreferences;
           import android.content.pm.ActivityInfo;
           import android.content.pm.PackageManager;
           import android.content.pm.ResolveInfo;
@@ -90,6 +93,9 @@ jobs:
           import android.graphics.Color;
           import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.Drawable;
+          import android.graphics.drawable.StateListDrawable;
+          import android.net.ConnectivityManager;
+          import android.net.NetworkInfo;
           import android.net.Uri;
           import android.os.Bundle;
           import android.os.Handler;
@@ -106,6 +112,7 @@ jobs:
           import android.widget.GridView;
           import android.widget.ImageView;
           import android.widget.LinearLayout;
+          import android.widget.TextClock;
           import android.widget.TextView;
 
           import java.text.Collator;
@@ -126,12 +133,17 @@ jobs:
                   ResolveInfo ri;
               }
 
+              private final List<App> all = new ArrayList<>();
               private final List<App> apps = new ArrayList<>();
+              private final Set<String> hidden = new HashSet<>();
+              private boolean showHidden = false;
               private final Handler ui = new Handler(Looper.getMainLooper());
               private final ExecutorService io = Executors.newSingleThreadExecutor();
               private PackageManager pm;
+              private SharedPreferences prefs;
               private GridView grid;
               private Adapter adapter;
+              private TextView wifiBtn, hiddenBtn;
               private LruCache<String, Bitmap> cache;
               private float dp;
               private int iconPx;
@@ -148,17 +160,53 @@ jobs:
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   pm = getPackageManager();
+                  prefs = getSharedPreferences("l", MODE_PRIVATE);
+                  hidden.addAll(prefs.getStringSet("h", new HashSet<String>()));
                   dp = getResources().getDisplayMetrics().density;
                   iconPx = (int) (64 * dp);
                   cache = new LruCache<String, Bitmap>(3 * 1024 * 1024) {
                       @Override protected int sizeOf(String k, Bitmap v) { return v.getByteCount(); }
                   };
 
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.HORIZONTAL);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  // ---- боковая панель ----
+                  LinearLayout panel = new LinearLayout(this);
+                  panel.setOrientation(LinearLayout.VERTICAL);
+                  int pp = (int) (20 * dp);
+                  panel.setPadding(pp, pp * 2, pp, pp);
+                  panel.setBackgroundColor(0xFF111111);
+
+                  TextClock time = new TextClock(this);
+                  time.setFormat24Hour("HH:mm");
+                  time.setFormat12Hour("HH:mm");
+                  time.setTextColor(Color.WHITE);
+                  time.setTextSize(TypedValue.COMPLEX_UNIT_SP, 48);
+                  panel.addView(time);
+
+                  TextClock date = new TextClock(this);
+                  date.setFormat24Hour("EEEE, d MMMM");
+                  date.setFormat12Hour("EEEE, d MMMM");
+                  date.setTextColor(0xFFAAAAAA);
+                  date.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                  panel.addView(date);
+
+                  wifiBtn = btn("Wi-Fi", v -> openSettings(Settings.ACTION_WIFI_SETTINGS));
+                  panel.addView(wifiBtn, btnParams(32));
+                  panel.addView(btn("Настройки", v -> openSettings(Settings.ACTION_SETTINGS)), btnParams(8));
+                  hiddenBtn = btn("Скрытые", v -> { showHidden = !showHidden; rebuild(); });
+                  panel.addView(hiddenBtn, btnParams(8));
+
+                  root.addView(panel, new LinearLayout.LayoutParams((int) (230 * dp), ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  // ---- сетка приложений ----
                   grid = new GridView(this);
-                  int widthDp = (int) (getResources().getDisplayMetrics().widthPixels / dp);
-                  grid.setNumColumns(Math.max(4, widthDp / 130));
+                  int widthDp = (int) (getResources().getDisplayMetrics().widthPixels / dp) - 230;
+                  grid.setNumColumns(Math.max(3, widthDp / 130));
                   grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
-                  int pad = (int) (32 * dp);
+                  int pad = (int) (24 * dp);
                   grid.setPadding(pad, pad, pad, pad);
                   grid.setClipToPadding(false);
                   grid.setVerticalSpacing((int) (8 * dp));
@@ -168,15 +216,11 @@ jobs:
                   adapter = new Adapter();
                   grid.setAdapter(adapter);
                   grid.setOnItemClickListener((p, v, pos, id) -> launch(apps.get(pos)));
-                  grid.setOnItemLongClickListener((p, v, pos, id) -> {
-                      try {
-                          startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                  Uri.parse("package:" + apps.get(pos).cn.getPackageName()))
-                                  .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                      } catch (Exception ignored) { }
-                      return true;
-                  });
-                  setContentView(grid);
+                  grid.setOnItemLongClickListener((p, v, pos, id) -> { menu(apps.get(pos)); return true; });
+                  root.addView(grid, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+                  setContentView(root);
+                  grid.requestFocus();
 
                   IntentFilter f = new IntentFilter();
                   f.addAction(Intent.ACTION_PACKAGE_ADDED);
@@ -186,6 +230,82 @@ jobs:
                   registerReceiver(pkgReceiver, f);
 
                   load();
+              }
+
+              private TextView btn(String text, View.OnClickListener l) {
+                  TextView v = new TextView(this);
+                  v.setText(text);
+                  v.setTextColor(Color.WHITE);
+                  v.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                  int p = (int) (12 * dp);
+                  v.setPadding(p, p, p, p);
+                  v.setSingleLine(true);
+                  v.setEllipsize(TextUtils.TruncateAt.END);
+                  v.setFocusable(true);
+                  v.setClickable(true);
+                  StateListDrawable sld = new StateListDrawable();
+                  sld.addState(new int[]{android.R.attr.state_focused}, new ColorDrawable(0x55FFFFFF));
+                  sld.addState(new int[]{}, new ColorDrawable(0x1AFFFFFF));
+                  v.setBackground(sld);
+                  v.setOnClickListener(l);
+                  return v;
+              }
+
+              private LinearLayout.LayoutParams btnParams(int topDp) {
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = (int) (topDp * dp);
+                  return lp;
+              }
+
+              private void openSettings(String action) {
+                  try {
+                      startActivity(new Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                  } catch (Exception e) {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                      } catch (Exception ignored) { }
+                  }
+              }
+
+              private void updateNet() {
+                  String s = "нет сети";
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                      NetworkInfo ni = cm.getActiveNetworkInfo();
+                      if (ni != null && ni.isConnected()) {
+                          s = ni.getType() == ConnectivityManager.TYPE_ETHERNET ? "кабель" : "подключён";
+                      }
+                  } catch (Exception ignored) { }
+                  wifiBtn.setText("Wi-Fi · " + s);
+              }
+
+              private void rebuild() {
+                  apps.clear();
+                  for (App a : all) if (showHidden || !hidden.contains(a.key)) apps.add(a);
+                  adapter.notifyDataSetChanged();
+                  hiddenBtn.setText(showHidden ? "Скрытые: видны" : "Скрытые: " + hidden.size());
+              }
+
+              private void menu(final App a) {
+                  final boolean h = hidden.contains(a.key);
+                  new AlertDialog.Builder(this)
+                          .setTitle(a.label)
+                          .setItems(new String[]{h ? "Показать иконку" : "Скрыть иконку", "О приложении / удалить"},
+                                  (d, w) -> {
+                                      if (w == 0) {
+                                          if (h) hidden.remove(a.key); else hidden.add(a.key);
+                                          prefs.edit().putStringSet("h", new HashSet<>(hidden)).apply();
+                                          rebuild();
+                                      } else {
+                                          try {
+                                              startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                                      Uri.parse("package:" + a.cn.getPackageName()))
+                                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                                          } catch (Exception ignored) { }
+                                      }
+                                  })
+                          .show();
               }
 
               private void load() {
@@ -215,9 +335,9 @@ jobs:
                       });
                       ui.post(() -> {
                           cache.evictAll();
-                          apps.clear();
-                          apps.addAll(out);
-                          adapter.notifyDataSetChanged();
+                          all.clear();
+                          all.addAll(out);
+                          rebuild();
                       });
                   });
               }
@@ -273,6 +393,7 @@ jobs:
                           h = (Holder) v.getTag();
                       }
                       final App a = apps.get(pos);
+                      v.setAlpha(hidden.contains(a.key) ? 0.4f : 1f);
                       h.text.setText(a.label);
                       h.icon.setTag(a.key);
                       Bitmap bm = cache.get(a.key);
@@ -293,17 +414,22 @@ jobs:
               }
 
               @Override
+              protected void onResume() {
+                  super.onResume();
+                  updateNet();
+              }
+
+              @Override
               protected void onNewIntent(Intent i) {
                   super.onNewIntent(i);
                   grid.setSelection(0);
+                  grid.requestFocus();
               }
 
               @Override
               public boolean onKeyDown(int code, KeyEvent e) {
                   if (code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_SETTINGS) {
-                      try {
-                          startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-                      } catch (Exception ignored) { }
+                      openSettings(Settings.ACTION_SETTINGS);
                       return true;
                   }
                   return super.onKeyDown(code, e);
