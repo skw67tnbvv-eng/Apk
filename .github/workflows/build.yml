@@ -1,0 +1,362 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+      - name: Create project
+        run: |
+          mkdir -p "launcher/$(dirname app/build.gradle)"
+          cat > launcher/app/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.fast.launcher'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.fast.launcher'
+                  minSdk 21
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      signingConfig signingConfigs.debug
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/AndroidManifest.xml)"
+          cat > launcher/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <application
+                  android:label="Fast Launcher"
+                  android:allowBackup="false"
+                  android:theme="@style/T">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode|screenLayout|smallestScreenSize|density|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/java/com/fast/launcher/MainActivity.java)"
+          cat > launcher/app/src/main/java/com/fast/launcher/MainActivity.java <<'EOF_FILE'
+          package com.fast.launcher;
+
+          import android.app.Activity;
+          import android.content.BroadcastReceiver;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.pm.ActivityInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.text.TextUtils;
+          import android.util.LruCache;
+          import android.util.TypedValue;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.BaseAdapter;
+          import android.widget.GridView;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import java.text.Collator;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          public class MainActivity extends Activity {
+
+              static final class App {
+                  String label, key;
+                  ComponentName cn;
+                  ResolveInfo ri;
+              }
+
+              private final List<App> apps = new ArrayList<>();
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final ExecutorService io = Executors.newSingleThreadExecutor();
+              private PackageManager pm;
+              private GridView grid;
+              private Adapter adapter;
+              private LruCache<String, Bitmap> cache;
+              private float dp;
+              private int iconPx;
+
+              private final Runnable reload = this::load;
+              private final BroadcastReceiver pkgReceiver = new BroadcastReceiver() {
+                  @Override public void onReceive(Context c, Intent i) {
+                      ui.removeCallbacks(reload);
+                      ui.postDelayed(reload, 500);
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  pm = getPackageManager();
+                  dp = getResources().getDisplayMetrics().density;
+                  iconPx = (int) (64 * dp);
+                  cache = new LruCache<String, Bitmap>(3 * 1024 * 1024) {
+                      @Override protected int sizeOf(String k, Bitmap v) { return v.getByteCount(); }
+                  };
+
+                  grid = new GridView(this);
+                  int widthDp = (int) (getResources().getDisplayMetrics().widthPixels / dp);
+                  grid.setNumColumns(Math.max(4, widthDp / 130));
+                  grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
+                  int pad = (int) (32 * dp);
+                  grid.setPadding(pad, pad, pad, pad);
+                  grid.setClipToPadding(false);
+                  grid.setVerticalSpacing((int) (8 * dp));
+                  grid.setSelector(new ColorDrawable(0x33FFFFFF));
+                  grid.setVerticalScrollBarEnabled(false);
+                  grid.setOverScrollMode(View.OVER_SCROLL_NEVER);
+                  adapter = new Adapter();
+                  grid.setAdapter(adapter);
+                  grid.setOnItemClickListener((p, v, pos, id) -> launch(apps.get(pos)));
+                  grid.setOnItemLongClickListener((p, v, pos, id) -> {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                  Uri.parse("package:" + apps.get(pos).cn.getPackageName()))
+                                  .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                      } catch (Exception ignored) { }
+                      return true;
+                  });
+                  setContentView(grid);
+
+                  IntentFilter f = new IntentFilter();
+                  f.addAction(Intent.ACTION_PACKAGE_ADDED);
+                  f.addAction(Intent.ACTION_PACKAGE_REMOVED);
+                  f.addAction(Intent.ACTION_PACKAGE_CHANGED);
+                  f.addDataScheme("package");
+                  registerReceiver(pkgReceiver, f);
+
+                  load();
+              }
+
+              private void load() {
+                  io.execute(() -> {
+                      List<App> out = new ArrayList<>();
+                      Set<String> seen = new HashSet<>();
+                      String[] cats = {Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER};
+                      for (String cat : cats) {
+                          Intent i = new Intent(Intent.ACTION_MAIN).addCategory(cat);
+                          for (ResolveInfo ri : pm.queryIntentActivities(i, 0)) {
+                              ActivityInfo ai = ri.activityInfo;
+                              if (ai.packageName.equals(getPackageName())) continue;
+                              ComponentName cn = new ComponentName(ai.packageName, ai.name);
+                              String key = cn.flattenToShortString();
+                              if (!seen.add(key)) continue;
+                              App a = new App();
+                              a.cn = cn;
+                              a.key = key;
+                              a.ri = ri;
+                              a.label = String.valueOf(ri.loadLabel(pm));
+                              out.add(a);
+                          }
+                      }
+                      final Collator col = Collator.getInstance();
+                      Collections.sort(out, new Comparator<App>() {
+                          @Override public int compare(App x, App y) { return col.compare(x.label, y.label); }
+                      });
+                      ui.post(() -> {
+                          cache.evictAll();
+                          apps.clear();
+                          apps.addAll(out);
+                          adapter.notifyDataSetChanged();
+                      });
+                  });
+              }
+
+              private void launch(App a) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_MAIN)
+                              .addCategory(Intent.CATEGORY_LAUNCHER)
+                              .setComponent(a.cn)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED));
+                  } catch (Exception ignored) { }
+              }
+
+              private Bitmap toBitmap(Drawable d) {
+                  Bitmap bm = Bitmap.createBitmap(iconPx, iconPx, Bitmap.Config.ARGB_8888);
+                  d.setBounds(0, 0, iconPx, iconPx);
+                  d.draw(new Canvas(bm));
+                  return bm;
+              }
+
+              private final class Holder { ImageView icon; TextView text; }
+
+              private final class Adapter extends BaseAdapter {
+                  @Override public int getCount() { return apps.size(); }
+                  @Override public Object getItem(int p) { return apps.get(p); }
+                  @Override public long getItemId(int p) { return p; }
+
+                  @Override
+                  public View getView(int pos, View v, ViewGroup parent) {
+                      final Holder h;
+                      if (v == null) {
+                          LinearLayout l = new LinearLayout(MainActivity.this);
+                          l.setOrientation(LinearLayout.VERTICAL);
+                          l.setGravity(Gravity.CENTER_HORIZONTAL);
+                          int p = (int) (12 * dp);
+                          l.setPadding(p, p, p, p);
+                          h = new Holder();
+                          h.icon = new ImageView(MainActivity.this);
+                          l.addView(h.icon, new LinearLayout.LayoutParams(iconPx, iconPx));
+                          h.text = new TextView(MainActivity.this);
+                          h.text.setTextColor(Color.WHITE);
+                          h.text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                          h.text.setSingleLine(true);
+                          h.text.setEllipsize(TextUtils.TruncateAt.END);
+                          h.text.setGravity(Gravity.CENTER);
+                          LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                          tp.topMargin = (int) (6 * dp);
+                          l.addView(h.text, tp);
+                          l.setTag(h);
+                          v = l;
+                      } else {
+                          h = (Holder) v.getTag();
+                      }
+                      final App a = apps.get(pos);
+                      h.text.setText(a.label);
+                      h.icon.setTag(a.key);
+                      Bitmap bm = cache.get(a.key);
+                      if (bm != null) {
+                          h.icon.setImageBitmap(bm);
+                      } else {
+                          h.icon.setImageDrawable(null);
+                          io.execute(() -> {
+                              final Bitmap n = toBitmap(a.ri.loadIcon(pm));
+                              cache.put(a.key, n);
+                              ui.post(() -> {
+                                  if (a.key.equals(h.icon.getTag())) h.icon.setImageBitmap(n);
+                              });
+                          });
+                      }
+                      return v;
+                  }
+              }
+
+              @Override
+              protected void onNewIntent(Intent i) {
+                  super.onNewIntent(i);
+                  grid.setSelection(0);
+              }
+
+              @Override
+              public boolean onKeyDown(int code, KeyEvent e) {
+                  if (code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_SETTINGS) {
+                      try {
+                          startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                      } catch (Exception ignored) { }
+                      return true;
+                  }
+                  return super.onKeyDown(code, e);
+              }
+
+              @Override public void onBackPressed() { /* лаунчер не закрывается */ }
+
+              @Override
+              public void onTrimMemory(int level) {
+                  super.onTrimMemory(level);
+                  if (level >= TRIM_MEMORY_UI_HIDDEN) cache.evictAll();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  unregisterReceiver(pkgReceiver);
+                  io.shutdownNow();
+                  super.onDestroy();
+              }
+          }
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/res/values/styles.xml)"
+          cat > launcher/app/src/main/res/values/styles.xml <<'EOF_FILE'
+          <resources>
+              <style name="T" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:windowAnimationStyle">@null</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p "launcher/$(dirname build.gradle)"
+          cat > launcher/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' version '8.1.4' apply false }
+          EOF_FILE
+          mkdir -p "launcher/$(dirname gradle.properties)"
+          cat > launcher/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx1536m
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p "launcher/$(dirname settings.gradle)"
+          cat > launcher/settings.gradle <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FastLauncher"
+          include ':app'
+          EOF_FILE
+      - name: Accept licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Build
+        run: gradle -p launcher assembleRelease --no-daemon
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp launcher/app/build/outputs/apk/release/app-release.apk FastLauncher.apk
+          gh release create "v${{ github.run_number }}" FastLauncher.apk --repo "${{ github.repository }}" --title "FastLauncher ${{ github.run_number }}" --notes "APK"
