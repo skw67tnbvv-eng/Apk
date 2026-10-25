@@ -26,7 +26,7 @@ jobs:
               compileSdk 34
               defaultConfig {
                   applicationId 'com.fast.launcher'
-                  minSdk 21
+                  minSdk 23
                   targetSdk 33
                   versionCode 1
                   versionName '1.0'
@@ -70,6 +70,19 @@ jobs:
                           <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service
+                      android:name=".ShutdownService"
+                      android:exported="true"
+                      android:label="Fast Launcher: выключение по таймеру"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/shutdown_service" />
+                  </service>
+                  <receiver android:name=".SleepReceiver" android:exported="false" />
               </application>
           </manifest>
           EOF_FILE
@@ -143,7 +156,7 @@ jobs:
               private SharedPreferences prefs;
               private GridView grid;
               private Adapter adapter;
-              private TextView wifiBtn, hiddenBtn;
+              private TextView wifiBtn, hiddenBtn, sleepBtn;
               private LruCache<String, Bitmap> cache;
               private float dp;
               private int iconPx;
@@ -196,6 +209,8 @@ jobs:
                   wifiBtn = btn("Wi-Fi", v -> openSettings(Settings.ACTION_WIFI_SETTINGS));
                   panel.addView(wifiBtn, btnParams(32));
                   panel.addView(btn("Настройки", v -> openSettings(Settings.ACTION_SETTINGS)), btnParams(8));
+                  sleepBtn = btn("Сон: выкл", v -> timerDialog());
+                  panel.addView(sleepBtn, btnParams(8));
                   hiddenBtn = btn("Скрытые", v -> { showHidden = !showHidden; rebuild(); });
                   panel.addView(hiddenBtn, btnParams(8));
 
@@ -278,6 +293,47 @@ jobs:
                       }
                   } catch (Exception ignored) { }
                   wifiBtn.setText("Wi-Fi · " + s);
+              }
+
+              private void updateTimerBtn() {
+                  long left = prefs.getLong("end", 0) - System.currentTimeMillis();
+                  sleepBtn.setText(left > 0 ? "Сон: " + ((left + 59999) / 60000) + " мин" : "Сон: выкл");
+              }
+
+              private void setTimer(int min) {
+                  android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+                  am.cancel(SleepReceiver.pi(this, "warn", 1));
+                  am.cancel(SleepReceiver.pi(this, "off", 2));
+                  if (min <= 0) {
+                      prefs.edit().putLong("end", 0).apply();
+                  } else {
+                      long end = System.currentTimeMillis() + min * 60000L;
+                      if (min > 1) am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, end - 60000,
+                              SleepReceiver.pi(this, "warn", 1));
+                      am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, end, SleepReceiver.pi(this, "off", 2));
+                      prefs.edit().putLong("end", end).apply();
+                      if (ShutdownService.instance == null)
+                          android.widget.Toast.makeText(this, "Служба выключения не включена, проектор не выключится",
+                                  android.widget.Toast.LENGTH_LONG).show();
+                  }
+                  updateTimerBtn();
+              }
+
+              private void timerDialog() {
+                  final List<String> names = new ArrayList<>();
+                  final List<Integer> mins = new ArrayList<>();
+                  if (ShutdownService.instance == null) { names.add("Сначала включить службу"); mins.add(-1); }
+                  for (int m : new int[]{15, 30, 45, 60, 90, 120}) { names.add(m + " мин"); mins.add(m); }
+                  names.add("1 мин (тест)"); mins.add(1);
+                  names.add("Отменить таймер"); mins.add(0);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Таймер сна")
+                          .setItems(names.toArray(new String[0]), (d, w) -> {
+                              int m = mins.get(w);
+                              if (m < 0) openSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                              else setTimer(m);
+                          })
+                          .show();
               }
 
               private void rebuild() {
@@ -417,6 +473,7 @@ jobs:
               protected void onResume() {
                   super.onResume();
                   updateNet();
+                  updateTimerBtn();
               }
 
               @Override
@@ -451,6 +508,110 @@ jobs:
               }
           }
           EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/java/com/fast/launcher/ShutdownService.java)"
+          cat > launcher/app/src/main/java/com/fast/launcher/ShutdownService.java <<'EOF_FILE'
+          package com.fast.launcher;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+
+          import java.util.List;
+
+          public class ShutdownService extends AccessibilityService {
+
+              static volatile ShutdownService instance;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private int tries;
+
+              @Override protected void onServiceConnected() { instance = this; }
+
+              @Override public boolean onUnbind(Intent i) {
+                  instance = null;
+                  return super.onUnbind(i);
+              }
+
+              @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
+              @Override public void onInterrupt() { }
+
+              void powerOff() {
+                  tries = 0;
+                  performGlobalAction(GLOBAL_ACTION_POWER_DIALOG);
+                  h.postDelayed(this::clickOff, 1200);
+              }
+
+              private void clickOff() {
+                  boolean ok = false;
+                  AccessibilityNodeInfo r = getRootInActiveWindow();
+                  if (r != null) ok = click(r);
+                  if (!ok) {
+                      List<AccessibilityWindowInfo> ws = getWindows();
+                      if (ws != null) {
+                          for (AccessibilityWindowInfo w : ws) {
+                              AccessibilityNodeInfo wr = w.getRoot();
+                              if (wr != null && click(wr)) { ok = true; break; }
+                          }
+                      }
+                  }
+                  if (!ok && ++tries < 8) h.postDelayed(this::clickOff, 800);
+              }
+
+              private boolean click(AccessibilityNodeInfo root) {
+                  String[] texts = {"Выключить", "Power off", "Выключение", "Отключить"};
+                  for (String s : texts) {
+                      List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(s);
+                      if (l == null) continue;
+                      for (AccessibilityNodeInfo n : l) {
+                          AccessibilityNodeInfo c = n;
+                          while (c != null && !c.isClickable()) c = c.getParent();
+                          if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+                      }
+                  }
+                  return false;
+              }
+          }
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/java/com/fast/launcher/SleepReceiver.java)"
+          cat > launcher/app/src/main/java/com/fast/launcher/SleepReceiver.java <<'EOF_FILE'
+          package com.fast.launcher;
+
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.widget.Toast;
+
+          public class SleepReceiver extends BroadcastReceiver {
+
+              static PendingIntent pi(Context c, String action, int code) {
+                  Intent i = new Intent(c, SleepReceiver.class).setAction(action);
+                  return PendingIntent.getBroadcast(c, code, i,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  if ("warn".equals(i.getAction())) {
+                      Toast.makeText(c, "Проектор выключится через минуту", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  c.getSharedPreferences("l", Context.MODE_PRIVATE).edit().putLong("end", 0).apply();
+                  ShutdownService s = ShutdownService.instance;
+                  if (s != null) s.powerOff();
+                  else Toast.makeText(c, "Служба выключения не включена", Toast.LENGTH_LONG).show();
+              }
+          }
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/res/values/strings.xml)"
+          cat > launcher/app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="svc_desc">Нужна, чтобы по таймеру сна сам нажимать «Выключить» в меню питания. Ничего не читает и не отправляет.</string>
+          </resources>
+          EOF_FILE
           mkdir -p "launcher/$(dirname app/src/main/res/values/styles.xml)"
           cat > launcher/app/src/main/res/values/styles.xml <<'EOF_FILE'
           <resources>
@@ -459,6 +620,16 @@ jobs:
                   <item name="android:windowAnimationStyle">@null</item>
               </style>
           </resources>
+          EOF_FILE
+          mkdir -p "launcher/$(dirname app/src/main/res/xml/shutdown_service.xml)"
+          cat > launcher/app/src/main/res/xml/shutdown_service.xml <<'EOF_FILE'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/svc_desc" />
           EOF_FILE
           mkdir -p "launcher/$(dirname build.gradle)"
           cat > launcher/build.gradle <<'EOF_FILE'
