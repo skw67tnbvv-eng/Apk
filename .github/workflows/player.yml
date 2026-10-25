@@ -1,0 +1,286 @@
+name: Build WebVimu
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/player.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+      - name: Create project
+        run: |
+          mkdir -p "player/$(dirname app/build.gradle)"
+          cat > player/app/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.fast.webvimu'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.fast.webvimu'
+                  minSdk 23
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      signingConfig signingConfigs.debug
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          EOF_FILE
+          mkdir -p "player/$(dirname app/src/main/AndroidManifest.xml)"
+          cat > player/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <queries>
+                  <package android:name="net.gtvbox.videoplayer" />
+              </queries>
+              <application
+                  android:label="WebVimu"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/T">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode|screenLayout|smallestScreenSize|density|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "player/$(dirname app/src/main/java/com/fast/webvimu/MainActivity.java)"
+          cat > player/app/src/main/java/com/fast/webvimu/MainActivity.java <<'EOF_FILE'
+          package com.fast.webvimu;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.KeyEvent;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.EditText;
+          import android.widget.Toast;
+
+          import java.io.ByteArrayInputStream;
+
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+
+              static final String VIMU = "net.gtvbox.videoplayer";
+              static final Pattern MEDIA = Pattern.compile(
+                      ".*\\.(mp4|m3u8|webm|mkv|mpd)(\\?.*)?$", Pattern.CASE_INSENSITIVE);
+              static final String[] ADS = {
+                      "exoclick.com", "exosrv.com", "exdynsrv.com", "realsrv.com", "magsrv.com",
+                      "juicyads.com", "juicyads.net", "trafficjunky.net", "trafficjunky.com",
+                      "trafficfactory.biz", "adsterra.com", "popads.net", "popcash.net",
+                      "propellerads.com", "clickadu.com", "hilltopads.net", "tsyndicate.com",
+                      "ero-advertising.com", "adspyglass.com", "a-ads.com", "adcash.com",
+                      "plugrush.com", "tubecorporate.com", "ad-maven.com", "doubleclick.net",
+                      "googlesyndication.com", "googleadservices.com", "adnxs.com",
+                      "taboola.com", "outbrain.com", "google-analytics.com", "yandex.ru/ads",
+                      "onclickads.net", "adxpansion.com", "bidgear.com", "mobiads.com"
+              };
+              static final String CSS = "ins.adsbygoogle,[id^=\"ad_\"],[class~=\"ad\"],[class~=\"ads\"],"
+                      + "[class~=\"advert\"],[class~=\"advertisement\"],[class~=\"adsbox\"],"
+                      + "iframe[src*=\"exoclick\"],iframe[src*=\"juicyads\"],iframe[src*=\"trafficjunky\"]"
+                      + "{display:none!important}";
+              static final String JS = "(function(){if(window.__v)return;window.__v=1;"
+                      + "var st=document.createElement('style');st.textContent='" + CSS.replace("'", "\\'") + "';"
+                      + "(document.head||document.documentElement).appendChild(st);"
+                      + "document.addEventListener('play',function(e){var v=e.target;"
+                      + "if(!v||v.tagName!=='VIDEO')return;var s=v.currentSrc||v.src||'';"
+                      + "v.pause();A.play(s);},true);})();";
+
+              private WebView wv;
+              private SharedPreferences prefs;
+              private volatile String lastMedia;
+
+              static boolean isAd(Uri u) {
+                  String h = u.getHost();
+                  if (h == null) return false;
+                  h = h.toLowerCase();
+                  if (h.startsWith("ads.") || h.startsWith("adserver.") || h.startsWith("banners.")) return true;
+                  for (String d : ADS) {
+                      if (h.equals(d) || h.endsWith("." + d)) return true;
+                  }
+                  return false;
+              }
+
+              private final class Bridge {
+                  @JavascriptInterface
+                  public void play(final String src) {
+                      runOnUiThread(new Runnable() {
+                          @Override public void run() { open(src); }
+                      });
+                  }
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  prefs = getSharedPreferences("p", MODE_PRIVATE);
+                  wv = new WebView(this);
+                  wv.setBackgroundColor(Color.BLACK);
+                  WebSettings s = wv.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(true);
+                  s.setJavaScriptCanOpenWindowsAutomatically(false);
+                  wv.addJavascriptInterface(new Bridge(), "A");
+                  wv.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          if (isAd(r.getUrl())) return true;
+                          String u = r.getUrl().toString();
+                          if (MEDIA.matcher(u).matches()) { open(u); return true; }
+                          String sch = r.getUrl().getScheme();
+                          return !("http".equals(sch) || "https".equals(sch));
+                      }
+
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                          if (isAd(r.getUrl())) {
+                              return new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
+                          }
+                          String u = r.getUrl().toString();
+                          if (MEDIA.matcher(u).matches()) lastMedia = u;
+                          return null;
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView v, String url) {
+                          v.evaluateJavascript(JS, null);
+                      }
+                  });
+                  setContentView(wv);
+                  wv.requestFocus();
+
+                  String u = prefs.getString("u", "");
+                  if (u.isEmpty()) ask(); else wv.loadUrl(u);
+              }
+
+              private void open(String src) {
+                  String u = (src != null && src.startsWith("http")) ? src : lastMedia;
+                  if (u == null) {
+                      Toast.makeText(this, "Не удалось найти ссылку на видео", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  Intent i = new Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(u), "video/*");
+                  try {
+                      startActivity(new Intent(i).setPackage(VIMU));
+                  } catch (Exception e) {
+                      try {
+                          startActivity(i);
+                      } catch (Exception e2) {
+                          Toast.makeText(this, "Не удалось открыть Vimu", Toast.LENGTH_LONG).show();
+                      }
+                  }
+              }
+
+              private void ask() {
+                  final EditText e = new EditText(this);
+                  e.setText(prefs.getString("u", "https://"));
+                  e.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                  e.setSingleLine(true);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Адрес сайта")
+                          .setView(e)
+                          .setPositiveButton("OK", (d, w) -> {
+                              String u = e.getText().toString().trim();
+                              if (u.isEmpty()) return;
+                              if (!u.contains("://")) u = "https://" + u;
+                              prefs.edit().putString("u", u).apply();
+                              wv.loadUrl(u);
+                          })
+                          .setNegativeButton("Отмена", null)
+                          .show();
+              }
+
+              @Override
+              public boolean onKeyDown(int code, KeyEvent e) {
+                  if (code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_SETTINGS) {
+                      ask();
+                      return true;
+                  }
+                  return super.onKeyDown(code, e);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (wv.canGoBack()) wv.goBack(); else super.onBackPressed();
+              }
+
+              @Override protected void onPause() { wv.onPause(); super.onPause(); }
+              @Override protected void onResume() { super.onResume(); wv.onResume(); }
+              @Override protected void onDestroy() { wv.destroy(); super.onDestroy(); }
+          }
+          EOF_FILE
+          mkdir -p "player/$(dirname app/src/main/res/values/styles.xml)"
+          cat > player/app/src/main/res/values/styles.xml <<'EOF_FILE'
+          <resources>
+              <style name="T" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p "player/$(dirname build.gradle)"
+          cat > player/build.gradle <<'EOF_FILE'
+          plugins { id 'com.android.application' version '8.1.4' apply false }
+          EOF_FILE
+          mkdir -p "player/$(dirname gradle.properties)"
+          cat > player/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx1536m
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p "player/$(dirname settings.gradle)"
+          cat > player/settings.gradle <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "WebVimu"
+          include ':app'
+          EOF_FILE
+      - name: Accept licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Build
+        run: gradle -p player assembleRelease --no-daemon
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp player/app/build/outputs/apk/release/app-release.apk WebVimu.apk
+          gh release create "p${{ github.run_number }}" WebVimu.apk --repo "${{ github.repository }}" --title "WebVimu ${{ github.run_number }}" --notes "APK"
